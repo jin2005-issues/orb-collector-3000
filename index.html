@@ -35,6 +35,25 @@
         }
         #health-bar { height: 100%; background: linear-gradient(90deg, #ff4444, #ff8888); border-radius: 3px; width: 100%; transition: width 0.3s; }
 
+        /* Power-up status */
+        .powerup-card {
+            background: rgba(0,0,0,0.55);
+            border: 2px solid rgba(255,255,255,0.15);
+            border-radius: 12px;
+            padding: 8px 18px;
+            color: #fff;
+            text-align: center;
+            backdrop-filter: blur(6px);
+            min-width: 80px;
+        }
+        #powerup-label { font-size: 10px; letter-spacing: 2px; opacity: 0.6; text-transform: uppercase; }
+        #powerup-bar-wrap {
+            width: 100%; height: 6px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 3px; overflow: hidden; margin-top: 4px;
+        }
+        #powerup-bar { height: 100%; border-radius: 3px; transition: width 0.1s linear; }
+
         /* Title screen */
         #title-screen {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -147,6 +166,11 @@
                 <div class="stat-label">Wave</div>
                 <div class="stat-value" id="wave-val" style="color:#00ffcc">1</div>
             </div>
+            <div class="stat-card" id="powerup-card" style="display:none;">
+                <div class="stat-label" id="powerup-label">POWER</div>
+                <div class="stat-value" id="powerup-val" style="font-size:16px;color:#44ffcc">—</div>
+                <div id="powerup-bar-wrap"><div id="powerup-bar" style="width:0%;background:#44ffcc"></div></div>
+            </div>
         </div>
         <div id="wave-banner"></div>
         <div id="collect-flash"></div>
@@ -176,6 +200,11 @@
         PLAYER_HEALTH: 3,
         INVINCIBLE_TIME: 1.5,
         WAVE_DURATION: 20,
+        // Power-up types
+        PU_TYPES: ['speed','shield','freeze','bomb'],
+        PU_SPEED_DUR: 6,
+        PU_SHIELD_DUR: 5,
+        PU_FREEZE_DUR: 5,
     };
 
     // ─── STATE ───────────────────────────────────────────────────────────────
@@ -191,6 +220,19 @@
         dashTimer: 0,
         screenShake: 0,
         time: 0,
+        // Power-up state
+        powerup: null,
+        powerupTimer: 0,
+        enemiesFrozen: false,
+        freezeTimer: 0,
+        // Boss state
+        bossActive: false,
+        boss: null,
+        bossHealth: 0,
+        bossMaxHealth: 0,
+        bossTimer: 0,
+        // BOSS_WAVE marks every 5th wave
+        BOSS_WAVE: 5,
     };
 
     // ─── RENDERER ────────────────────────────────────────────────────────────
@@ -416,6 +458,144 @@
         return group;
     }
 
+    // ─── POWER-UP ORB FACTORY ───────────────────────────────────────────────
+    const PU_COLORS = {
+        speed:   { hex: 0x44aaff, emissive: 0x44aaff, label: 'SPEED',    color: '#44aaff', sound: [660, 880] },
+        shield:  { hex: 0x44ff88, emissive: 0x44ff88, label: 'SHIELD',   color: '#44ff88', sound: [440, 550, 660] },
+        freeze:  { hex: 0x88aaff, emissive: 0x88aaff, label: 'FREEZE',   color: '#88aaff', sound: [220, 330, 440] },
+        bomb:    { hex: 0xff4444, emissive: 0xff4444, label: 'BOMB',     color: '#ff4444', sound: [110, 80, 55] },
+    };
+
+    function createPowerupOrb(type, pos) {
+        const cfg = PU_COLORS[type];
+        const group = new THREE.Group();
+
+        // Outer rotating ring
+        const ringMat = new THREE.MeshStandardMaterial({ color: cfg.hex, emissive: cfg.emissive, emissiveIntensity: 2.5, transparent: true, opacity: 0.7, wireframe: true });
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(0.6, 0.08, 8, 24), ringMat);
+        ring.rotation.x = Math.PI / 2;
+        group.add(ring);
+        group._ring = ring;
+
+        // Inner core
+        const coreMat = new THREE.MeshStandardMaterial({ color: cfg.hex, emissive: cfg.emissive, emissiveIntensity: 3 });
+        const core = new THREE.Mesh(new THREE.SphereGeometry(0.4, 16, 16), coreMat);
+        group.add(core);
+        group._core = core;
+
+        // Star accent (4-pointed)
+        const starMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: cfg.emissive, emissiveIntensity: 4, transparent: true, opacity: 0.9 });
+        const starGeo = new THREE.OctahedronGeometry(0.2, 0);
+        const star = new THREE.Mesh(starGeo, starMat);
+        group.add(star);
+        group._star = star;
+
+        group.position.copy(pos);
+        group._bobOffset = Math.random() * Math.PI * 2;
+        group._type = type;
+        group._color = cfg.hex;
+
+        scene.add(group);
+        return group;
+    }
+
+    function maybeSpawnPowerup(originPos) {
+        if (Math.random() > 0.12) return null;
+        const types = C.PU_TYPES;
+        const type = types[Math.floor(Math.random() * types.length)];
+        const offset = new THREE.Vector3((Math.random()-0.5)*4, 0, (Math.random()-0.5)*4);
+        const orb = createPowerupOrb(type, originPos.clone().add(offset));
+        activeOrbs.push(orb);
+        return orb;
+    }
+
+    function activatePowerup(type) {
+        const cfg = PU_COLORS[type];
+        const dur = type === 'speed' ? C.PU_SPEED_DUR
+            : type === 'shield' ? C.PU_SHIELD_DUR
+            : type === 'freeze' ? C.PU_FREEZE_DUR
+            : 0;
+
+        state.powerup = type;
+        state.powerupTimer = dur;
+
+        const labelEl = document.getElementById('powerup-label');
+        const valEl = document.getElementById('powerup-val');
+        const card = document.getElementById('powerup-card');
+        const bar = document.getElementById('powerup-bar');
+
+        card.style.display = 'block';
+        labelEl.textContent = cfg.label;
+        valEl.textContent = cfg.label;
+        valEl.style.color = cfg.color;
+        bar.style.background = cfg.color;
+        bar.style.width = '100%';
+
+        // Sound
+        const sounds = cfg.sound;
+        sounds.forEach((f, i) => setTimeout(() => playTone(f, 0.2, 'sine', 0.3), i * 80));
+
+        // Type-specific effects
+        if (type === 'freeze') {
+            state.enemiesFrozen = true;
+            state.freezeTimer = dur;
+            // Tint enemies blue
+            enemies.forEach(e => { e.traverse(c => { if (c.isMesh && c.material) { c.material.emissive?.set(0x4488ff); c.material.emissiveIntensity = 1.5; }}); });
+        }
+        if (type === 'bomb') {
+            // Kill all enemies!
+            const killCount = enemies.length;
+            enemies.forEach(e => {
+                emitParticles(damageParticles, e.position, 40, 8, 0xff4444);
+                scene.remove(e);
+            });
+            enemies.length = 0;
+            state.score += killCount * 50;
+            addShake(0.6);
+            flashDamage();
+            addKillFeed(`💥 BOMB! ${killCount} enemies destroyed!`);
+            spawnDamageNumber(player.position, `+${killCount*50}`, '#ff4444');
+            updateHUD();
+        }
+        if (type === 'shield') {
+            // Instant invincibility + visual
+            state.invincibleTimer = Math.max(state.invincibleTimer, dur);
+            // Blue shield aura on player
+            player.traverse(c => { if (c.isMesh && c.material) { c.material.emissive?.set(0x44ff88); c.material.emissiveIntensity = 0.5; }});
+        }
+        if (type === 'speed') {
+            // Speed boost handled in updatePlayer
+        }
+    }
+
+    function updatePowerups(delta) {
+        if (state.powerup && state.powerupTimer > 0) {
+            state.powerupTimer -= delta;
+            const bar = document.getElementById('powerup-bar');
+            const dur = state.powerup === 'speed' ? C.PU_SPEED_DUR
+                : state.powerup === 'shield' ? C.PU_SHIELD_DUR
+                : state.powerup === 'freeze' ? C.PU_FREEZE_DUR : 1;
+            bar.style.width = Math.max(0, state.powerupTimer / dur * 100) + '%';
+            if (state.powerupTimer <= 0) {
+                deactivatePowerup();
+            }
+        }
+        if (state.enemiesFrozen) {
+            state.freezeTimer -= delta;
+            if (state.freezeTimer <= 0) {
+                state.enemiesFrozen = false;
+                enemies.forEach(e => { e.traverse(c => { if (c.isMesh && c.material && c.material.emissive) { c.material.emissive.set(0xff0000); c.material.emissiveIntensity = 1; }}); });
+            }
+        }
+    }
+
+    function deactivatePowerup() {
+        state.powerup = null;
+        document.getElementById('powerup-card').style.display = 'none';
+        // Restore player emissive
+        player.traverse(c => { if (c.isMesh && c.material && c.material.emissive) { c.material.emissive.set(0x000000); c.material.emissiveIntensity = 0; }});
+    }
+
     // ─── ORB FACTORY ─────────────────────────────────────────────────────────
     const orbPool = [];
     const activeOrbs = [];
@@ -452,6 +632,147 @@
             const orb = createOrb(i);
             activeOrbs.push(orb);
         }
+    }
+
+    function spawnOrbs() {
+        activeOrbs.forEach(o => scene.remove(o));
+        activeOrbs.length = 0;
+        for (let i = 0; i < C.ORB_COUNT; i++) {
+            const orb = createOrb(i);
+            activeOrbs.push(orb);
+        }
+    }
+
+    // ─── BOSS FACTORY ─────────────────────────────────────────────────────────
+    let bossHealthBar = null;
+
+    function createBossHealthBar() {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = `position:fixed;bottom:30px;left:50%;transform:translateX(-50%);width:300px;z-index:50;display:none;`;
+        wrap.innerHTML = `
+            <div style="text-align:center;color:#ff4444;font-weight:bold;font-size:14px;letter-spacing:3px;margin-bottom:6px;text-shadow:0 0 10px #ff0000">⚠ BOSS ⚠</div>
+            <div style="background:rgba(0,0,0,0.6);border:2px solid #ff4444;border-radius:6px;overflow:hidden;height:14px;">
+                <div id="boss-hp-bar" style="height:100%;background:linear-gradient(90deg,#ff0000,#ff4444);width:100%;transition:width 0.2s;border-radius:4px;"></div>
+            </div>`;
+        document.body.appendChild(wrap);
+        return wrap;
+    }
+
+    function createBoss() {
+        const group = new THREE.Group();
+
+        // Main body — big icosahedron
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0xcc0000, emissive: 0xcc0000, emissiveIntensity: 0.8, metalness: 0.7, roughness: 0.2 });
+        const body = new THREE.Mesh(new THREE.IcosahedronGeometry(2.5, 1), bodyMat);
+        body.castShadow = true;
+        group.add(body);
+
+        // Inner glow sphere
+        const glowMat = new THREE.MeshStandardMaterial({ color: 0xff4400, emissive: 0xff4400, emissiveIntensity: 3, transparent: true, opacity: 0.6 });
+        const glow = new THREE.Mesh(new THREE.SphereGeometry(1.8, 16, 16), glowMat);
+        group.add(glow);
+
+        // Evil eyes
+        const eyeMat = new THREE.MeshStandardMaterial({ color: 0xffff00, emissive: 0xffff00, emissiveIntensity: 4 });
+        [-0.6, 0.6].forEach(ex => {
+            const eye = new THREE.Mesh(new THREE.SphereGeometry(0.25, 8, 8), eyeMat);
+            eye.position.set(ex, 0.5, 2.0); group.add(eye);
+            // Pupil
+            const pupil = new THREE.Mesh(new THREE.SphereGeometry(0.12, 6, 6), new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x000000 }));
+            pupil.position.set(ex, 0.5, 2.25); group.add(pupil);
+        });
+
+        // Rotating ring of spikes
+        const spikeMat = new THREE.MeshStandardMaterial({ color: 0x880000, emissive: 0x880000, emissiveIntensity: 1 });
+        for (let s = 0; s < 8; s++) {
+            const spike = new THREE.Mesh(new THREE.ConeGeometry(0.3, 1.2, 5), spikeMat);
+            const a = (s / 8) * Math.PI * 2;
+            spike.position.set(Math.cos(a) * 2.8, 0, Math.sin(a) * 2.8);
+            spike.rotation.z = Math.PI / 2;
+            spike.rotation.y = a;
+            group.add(spike);
+        }
+
+        group.position.set(0, 3, -20);
+        group._body = body; group._glow = glow;
+        scene.add(group);
+
+        // Point light for boss aura
+        const bossLight = new THREE.PointLight(0xff0000, 3, 25);
+        bossLight.position.set(0, 3, -20);
+        scene.add(bossLight);
+        group._light = bossLight;
+
+        return group;
+    }
+
+    function spawnBoss() {
+        if (state.boss) {
+            scene.remove(state.boss);
+            scene.remove(state.boss._light);
+        }
+        state.boss = createBoss();
+        state.bossActive = true;
+        state.bossHealth = 20;
+        state.bossMaxHealth = 20;
+        state.bossTimer = 0;
+        if (!bossHealthBar) bossHealthBar = createBossHealthBar();
+        bossHealthBar.style.display = 'block';
+        addKillFeed('💀 BOSS SPAWNED!');
+        addShake(0.5);
+    }
+
+    function updateBoss(delta) {
+        if (!state.boss || !state.bossActive) return;
+        const boss = state.boss;
+
+        // Float and rotate
+        boss._body.rotation.x += delta * 0.5;
+        boss._body.rotation.y += delta * 0.7;
+        boss._glow.rotation.y -= delta * 1.5;
+        boss.position.y = 3 + Math.sin(state.time * 1.5) * 0.5;
+
+        // Slowly drift toward player
+        const toPlayer = player.position.clone().sub(boss.position);
+        toPlayer.y = 0;
+        boss.position.addScaledVector(toPlayer.normalize(), 1.5 * delta);
+        boss._light.position.copy(boss.position);
+
+        // Update health bar
+        const pct = Math.max(0, state.bossHealth / state.bossMaxHealth * 100);
+        document.getElementById('boss-hp-bar').style.width = pct + '%';
+
+        // Collision with player
+        if (player.position.distanceTo(boss.position) < 3.5 && state.invincibleTimer <= 0) {
+            state.health--;
+            state.invincibleTimer = C.INVINCIBLE_TIME;
+            emitParticles(damageParticles, player.position, 30, 6, 0xff4444);
+            flashDamage();
+            addShake(0.6);
+            playDamage();
+            spawnDamageNumber(player.position, '-1', '#ff4444');
+            updateHUD();
+            if (state.health <= 0) gameOver();
+        }
+    }
+
+    function defeatBoss() {
+        if (!state.boss) return;
+        emitParticles(damageParticles, state.boss.position, 80, 10, 0xff4400);
+        addShake(1.0);
+        scene.remove(state.boss);
+        scene.remove(state.boss._light);
+        state.boss = null;
+        state.bossActive = false;
+        if (bossHealthBar) bossHealthBar.style.display = 'none';
+        state.score += 500;
+        spawnDamageNumber(new THREE.Vector3(0, 3, -10), '+500 BOSS!', '#ffdd44');
+        addKillFeed('💀 BOSS DEFEATED! +500');
+        updateHUD();
+        // Heal player fully
+        state.health = C.PLAYER_HEALTH;
+        updateHUD();
+        playWave();
     }
 
     // ─── ENEMY FACTORY ────────────────────────────────────────────────────────
@@ -505,6 +826,19 @@
         const count = 2 + state.wave;
         for (let i = 0; i < count; i++) {
             const e = createEnemy(i);
+            enemies.push(e);
+        }
+    }
+
+    function spawnEnemiesForBoss() {
+        enemies.forEach(e => scene.remove(e));
+        enemies.length = 0;
+        const count = Math.max(3, state.wave - 2);
+        for (let i = 0; i < count; i++) {
+            const e = createEnemy(i);
+            // Position them around the arena edge during boss
+            const angle = (i / count) * Math.PI * 2;
+            e.position.set(Math.cos(angle) * (C.ARENA - 5), 0.5, Math.sin(angle) * (C.ARENA - 5));
             enemies.push(e);
         }
     }
@@ -669,9 +1003,12 @@
     }
 
     function playCollect() { playTone(880, 0.1, 'sine', 0.25); setTimeout(() => playTone(1320, 0.15, 'sine', 0.2), 80); }
+    function playPowerup() { playTone(880, 0.1, 'sine', 0.25); setTimeout(() => playTone(1320, 0.15, 'sine', 0.2), 80); }
     function playDamage() { playTone(150, 0.2, 'sawtooth', 0.3); playTone(100, 0.3, 'square', 0.15); }
     function playWave() { [440, 550, 660, 880].forEach((f, i) => setTimeout(() => playTone(f, 0.2, 'sine', 0.25), i * 100)); }
     function playGameOver() { [440, 330, 220, 110].forEach((f, i) => setTimeout(() => playTone(f, 0.4, 'sawtooth', 0.2), i * 150)); }
+    function playBoss() { [220, 220, 330, 220, 110].forEach((f, i) => setTimeout(() => playTone(f, 0.35, 'sawtooth', 0.35), i * 120)); }
+    function playBossDefeat() { [440, 550, 660, 770, 880, 1100, 1320].forEach((f, i) => setTimeout(() => playTone(f, 0.3, 'sine', 0.3), i * 80)); }
 
     // ─── GAME FLOW ────────────────────────────────────────────────────────────
     function startGame() {
@@ -684,6 +1021,13 @@
         state.dashCooldown = 0;
         state.isDashing = false;
         state.screenShake = 0;
+        state.powerup = null;
+        state.powerupTimer = 0;
+        state.enemiesFrozen = false;
+        state.bossActive = false;
+        if (state.boss) { scene.remove(state.boss); scene.remove(state.boss._light); state.boss = null; }
+        if (bossHealthBar) bossHealthBar.style.display = 'none';
+        document.getElementById('powerup-card').style.display = 'none';
         player.position.set(0, 0, 0);
         camYaw = 0; camPitch = 0.45; camDist = 14;
         document.getElementById('title-screen').style.display = 'none';
@@ -756,7 +1100,9 @@
     function updatePlayer(delta) {
         if (state.mode !== 'playing') return;
 
-        const speed = state.isDashing ? C.DASH_SPEED : C.PLAYER_SPEED;
+        // Speed power-up modifier
+        const speedMult = (state.powerup === 'speed') ? 2.0 : 1.0;
+        const speed = (state.isDashing ? C.DASH_SPEED : C.PLAYER_SPEED) * speedMult;
         const inputX = Number(keys['KeyD'] || keys['ArrowRight']) - Number(keys['KeyA'] || keys['ArrowLeft']);
         const inputZ = Number(keys['KeyS'] || keys['ArrowDown']) - Number(keys['KeyW'] || keys['ArrowUp']);
 
@@ -832,7 +1178,17 @@
 
             const dist = player.position.distanceTo(orb.position);
             if (dist < 1.3) {
-                // Collect!
+                // Check if it's a power-up orb
+                if (orb._type) {
+                    activatePowerup(orb._type);
+                    emitParticles(collectParticles, orb.position, 30, 8, orb._color);
+                    spawnDamageNumber(orb.position, PU_COLORS[orb._type].label, PU_COLORS[orb._type].color);
+                    addShake(0.2);
+                    playPowerup();
+                    scene.remove(orb);
+                    return;
+                }
+                // Normal orb collect
                 emitParticles(collectParticles, orb.position, 25, 7, orb._color);
                 spawnDamageNumber(orb.position, `+${C.ORB_SCORE}`, '#ffdd44');
                 scene.remove(orb);
@@ -843,12 +1199,24 @@
                 playCollect();
                 updateHUD();
 
+                // Maybe spawn a power-up where this orb was
+                const pu = maybeSpawnPowerup(orb.position);
+
                 // Respawn new orb after short delay
                 setTimeout(() => {
                     if (state.mode !== 'playing') return;
                     const newOrb = createOrb(Math.floor(Math.random() * C.ORB_COUNT));
                     activeOrbs.push(newOrb);
                 }, 2000);
+            } else {
+                // Animate power-up orbs
+                if (orb._type) {
+                    orb._bobOffset += delta * 3;
+                    orb.position.y = 1.2 + Math.sin(orb._bobOffset) * 0.35;
+                    if (orb._ring) orb._ring.rotation.z += delta * 2.5;
+                    if (orb._core) orb._core.rotation.y += delta * 3;
+                    if (orb._star) { orb._star.rotation.x += delta * 5; orb._star.rotation.z += delta * 4; }
+                }
             }
         }
     }
@@ -857,17 +1225,14 @@
     function updateEnemies(delta) {
         if (state.mode !== 'playing') return;
         enemies.forEach(enemy => {
+            const spd = state.enemiesFrozen ? 0 : enemy.userData.speed;
             const dir = player.position.clone().sub(enemy.position).normalize();
-            const spd = enemy.userData.speed;
             enemy.position.addScaledVector(dir, spd * delta);
             enemy.position.y = 0.5 + Math.sin(state.time * 4 + enemy.position.x) * 0.1;
-
-            // Rotation
-            enemy.rotation.y += delta * 2;
+            enemy.rotation.y += state.enemiesFrozen ? 0 : delta * 2;
 
             // Collision with player
-            const dist = player.position.distanceTo(enemy.position);
-            if (dist < 1.2 && state.invincibleTimer <= 0) {
+            if (player.position.distanceTo(enemy.position) < 1.2 && state.invincibleTimer <= 0) {
                 state.health--;
                 state.invincibleTimer = C.INVINCIBLE_TIME;
                 emitParticles(damageParticles, player.position, 30, 6, 0xff4444);
@@ -881,19 +1246,54 @@
         });
     }
 
+    function updateBossDamage() {
+        if (!state.bossActive) return;
+        if (!state.boss) return;
+        // Check if player dashes into boss
+        if (state.isDashing && player.position.distanceTo(state.boss.position) < 4.0) {
+            state.bossHealth--;
+            emitParticles(damageParticles, state.boss.position, 20, 5, 0xff6600);
+            addShake(0.3);
+            playTone(200, 0.15, 'sawtooth', 0.3);
+            spawnDamageNumber(state.boss.position, '-1', '#ff6600');
+            if (state.bossHealth <= 0) {
+                defeatBoss();
+                playBossDefeat();
+            }
+        }
+    }
+
+    function startBossWave(waveNum) {
+        spawnBoss();
+        spawnEnemiesForBoss();
+        const bannerText = waveNum === 5 ? '🆂🅱🅾🆂🆂  🆆🅰🆅🅴 🅵🅸🆅🅴!' : `💀 BOSS WAVE ${waveNum}!`;
+        showWaveBanner(bannerText);
+        playBoss();
+    }
+
+    function startNormalWave(waveNum) {
+        spawnOrbs();
+        spawnEnemies();
+        state.health = Math.min(state.health + 1, C.PLAYER_HEALTH);
+        updateHUD();
+        showWaveBanner(`WAVE ${waveNum}`);
+        playWave();
+    }
+
     // ─── WAVE SYSTEM ───────────────────────────────────────────────────────────
     function updateWave(delta) {
         if (state.mode !== 'playing') return;
+        if (state.bossActive) return; // Boss waves don't auto-advance
         state.waveTimer += delta;
         if (state.waveTimer >= C.WAVE_DURATION) {
             state.waveTimer = 0;
             state.wave++;
-            spawnEnemies();
-            // Heal a bit each wave
-            state.health = Math.min(state.health + 1, C.PLAYER_HEALTH);
-            updateHUD();
-            showWaveBanner(`WAVE ${state.wave}`);
-            playWave();
+            const isBossWave = state.wave % state.BOSS_WAVE === 0;
+            if (isBossWave) {
+                startBossWave(state.wave);
+            } else {
+                startNormalWave(state.wave);
+            }
         }
     }
 
@@ -923,6 +1323,9 @@
         updatePlayer(delta);
         updateOrbs(delta);
         updateEnemies(delta);
+        updateBoss(delta);
+        updateBossDamage();
+        updatePowerups(delta);
         updateWave(delta);
         updateCamera(delta);
         updateDeco(delta);
